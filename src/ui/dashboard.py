@@ -1,7 +1,9 @@
-"""Streamlit dashboard for the arbitrage bot."""
+"""Streamlit dashboard for the arbitrage bot - Real-time view."""
 
+import json
+import time
 from datetime import datetime
-from decimal import Decimal
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -16,6 +18,36 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# State file from simulation
+STATE_FILE = Path("data/simulation_state.json")
+
+
+def load_state() -> dict:
+    """Load current state from simulation."""
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {
+        "is_running": False,
+        "portfolio": {
+            "total_value_usd": 10000,
+            "initial_value_usd": 10000,
+            "total_pnl_usd": 0,
+            "total_pnl_percent": 0,
+            "total_trades": 0,
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "win_rate": 0,
+            "max_drawdown_percent": 0,
+        },
+        "recent_trades": [],
+        "recent_opportunities": [],
+        "statistics": {},
+    }
+
+
 # Custom CSS
 st.markdown(
     """
@@ -26,126 +58,130 @@ st.markdown(
         padding: 20px;
         margin: 10px 0;
     }
-    .profit { color: #00FF00; }
-    .loss { color: #FF4444; }
+    .profit { color: #00FF00 !important; }
+    .loss { color: #FF4444 !important; }
     .stMetric > div { background-color: #262730; padding: 10px; border-radius: 5px; }
+    .live-indicator {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        background-color: #00FF00;
+        border-radius: 50%;
+        animation: pulse 1s infinite;
+        margin-right: 8px;
+    }
+    @keyframes pulse {
+        0% { opacity: 1; }
+        50% { opacity: 0.5; }
+        100% { opacity: 1; }
+    }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# Initialize session state
-if "portfolio" not in st.session_state:
-    st.session_state.portfolio = None
-if "trades" not in st.session_state:
-    st.session_state.trades = []
-if "opportunities" not in st.session_state:
-    st.session_state.opportunities = []
+# Load current state
+state = load_state()
+portfolio = state.get("portfolio", {})
+trades = state.get("recent_trades", [])
+opportunities = state.get("recent_opportunities", [])
+is_running = state.get("is_running", False)
 
 # Sidebar
 with st.sidebar:
-    st.title("⚙️ Settings")
+    st.title("⚙️ Control Panel")
 
-    trading_mode = st.selectbox(
-        "Trading Mode",
-        ["Paper Trading", "Live Trading (Disabled)"],
-        index=0,
-        key="trading_mode",
-    )
+    # Auto-refresh toggle
+    auto_refresh = st.toggle("Auto Refresh", value=True, key="auto_refresh")
+    refresh_rate = st.slider("Refresh Rate (s)", 1, 10, 2, key="refresh_rate")
 
     st.divider()
 
-    st.subheader("Markets")
-    crypto_enabled = st.checkbox("Crypto", value=True, key="crypto_enabled")
-    forex_enabled = st.checkbox("Forex", value=False, key="forex_enabled")
-    prediction_enabled = st.checkbox("Prediction Markets", value=False, key="prediction_enabled")
+    st.subheader("Bot Status")
+    if is_running:
+        st.markdown('<span class="live-indicator"></span> **RUNNING**', unsafe_allow_html=True)
+        st.success("Simulation active")
+    else:
+        st.warning("Bot stopped")
 
     st.divider()
 
-    st.subheader("Risk Settings")
-    min_profit = st.slider(
-        "Min Profit %",
-        min_value=0.01,
-        max_value=1.0,
-        value=0.1,
-        step=0.01,
-        key="min_profit",
-    )
-    max_position = st.number_input(
-        "Max Position ($)",
-        min_value=100,
-        max_value=100000,
-        value=1000,
-        step=100,
-        key="max_position",
-    )
+    st.subheader("Quick Stats")
+    st.metric("Total Trades", portfolio.get("total_trades", 0))
+    st.metric("Win Rate", f"{portfolio.get('win_rate', 0):.1f}%")
 
     st.divider()
 
-    if st.button("🔄 Refresh Data", use_container_width=True, key="refresh_btn"):
+    if st.button("🔄 Manual Refresh", use_container_width=True, key="refresh_btn"):
         st.rerun()
 
-# Debug mode (hidden feature)
-if st.query_params.get("debug") == "true":
-    st.json(
-        {
-            "current_view": "dashboard",
-            "portfolio": st.session_state.portfolio,
-            "trade_count": len(st.session_state.trades),
-            "opportunity_count": len(st.session_state.opportunities),
-        }
-    )
+    updated_at = state.get("updated_at", "Never")
+    if updated_at != "Never":
+        try:
+            dt = datetime.fromisoformat(updated_at)
+            updated_at = dt.strftime("%H:%M:%S")
+        except Exception:
+            pass
+    st.caption(f"Last update: {updated_at}")
 
 # Main content
-st.title("📈 Arbitrage Bot Dashboard")
-
-# Demo data for display
-demo_portfolio = {
-    "total_value_usd": Decimal("10523.45"),
-    "total_pnl_usd": Decimal("523.45"),
-    "total_pnl_percent": Decimal("5.23"),
-    "total_trades": 127,
-    "winning_trades": 98,
-    "losing_trades": 29,
-    "win_rate": Decimal("77.2"),
-    "max_drawdown_percent": Decimal("2.1"),
-}
+col_title, col_status = st.columns([4, 1])
+with col_title:
+    st.title("📈 Arbitrage Bot Dashboard")
+with col_status:
+    if is_running:
+        st.markdown(
+            '<div style="text-align:right;padding-top:20px;">'
+            '<span class="live-indicator"></span> <b>LIVE</b></div>',
+            unsafe_allow_html=True,
+        )
 
 # Top metrics row
 col1, col2, col3, col4, col5 = st.columns(5)
 
+pnl = portfolio.get("total_pnl_usd", 0)
+pnl_pct = portfolio.get("total_pnl_percent", 0)
+total_value = portfolio.get("total_value_usd", 10000)
+
 with col1:
+    delta_color = "normal" if pnl >= 0 else "inverse"
     st.metric(
         "Portfolio Value",
-        f"${demo_portfolio['total_value_usd']:,.2f}",
-        f"+${demo_portfolio['total_pnl_usd']:,.2f}",
+        f"${total_value:,.2f}",
+        f"{pnl:+,.2f}" if pnl != 0 else None,
+        delta_color=delta_color,
     )
 
 with col2:
     st.metric(
         "Total P&L",
-        f"{demo_portfolio['total_pnl_percent']:.2f}%",
-        f"{demo_portfolio['total_trades']} trades",
+        f"${pnl:+,.2f}",
+        f"{pnl_pct:+.2f}%",
+        delta_color="normal" if pnl >= 0 else "inverse",
     )
 
 with col3:
+    win_rate = portfolio.get("win_rate", 0)
+    wins = portfolio.get("winning_trades", 0)
+    losses = portfolio.get("losing_trades", 0)
     st.metric(
         "Win Rate",
-        f"{demo_portfolio['win_rate']:.1f}%",
-        f"{demo_portfolio['winning_trades']}W / {demo_portfolio['losing_trades']}L",
+        f"{win_rate:.1f}%",
+        f"{wins}W / {losses}L",
     )
 
 with col4:
+    drawdown = portfolio.get("max_drawdown_percent", 0)
     st.metric(
         "Max Drawdown",
-        f"{demo_portfolio['max_drawdown_percent']:.2f}%",
+        f"{drawdown:.2f}%",
         None,
     )
 
 with col5:
     st.metric(
-        "Bot Status",
-        "🟢 Active",
+        "Total Trades",
+        portfolio.get("total_trades", 0),
         "Paper Mode",
     )
 
@@ -158,273 +194,231 @@ tab1, tab2, tab3, tab4 = st.tabs(
 
 # Tab 1: Live Opportunities
 with tab1:
-    st.subheader("Current Arbitrage Opportunities")
+    st.subheader("Recent Arbitrage Opportunities")
 
-    opportunities_data = [
-        {
-            "Symbol": "BTC/USDT",
-            "Buy": "Binance",
-            "Sell": "Kraken",
-            "Spread": "0.15%",
-            "Net Profit": "0.08%",
-            "Volume": "$2,500",
-            "Risk": "🟢 Low",
-            "Expires": "4.2s",
-        },
-        {
-            "Symbol": "ETH/USDT",
-            "Buy": "Coinbase",
-            "Sell": "Binance",
-            "Spread": "0.12%",
-            "Net Profit": "0.05%",
-            "Volume": "$1,800",
-            "Risk": "🟡 Medium",
-            "Expires": "2.8s",
-        },
-        {
-            "Symbol": "SOL/USDT",
-            "Buy": "Binance",
-            "Sell": "Coinbase",
-            "Spread": "0.18%",
-            "Net Profit": "0.11%",
-            "Volume": "$3,200",
-            "Risk": "🟢 Low",
-            "Expires": "3.5s",
-        },
-    ]
+    if opportunities:
+        # Show last 20 opportunities
+        recent_opps = opportunities[-20:][::-1]  # Reverse to show newest first
 
-    if opportunities_data:
-        df = pd.DataFrame(opportunities_data)
+        opp_display = []
+        for opp in recent_opps:
+            opp_display.append({
+                "Time": datetime.fromisoformat(opp["detected_at"]).strftime("%H:%M:%S") if opp.get("detected_at") else "-",
+                "Symbol": opp.get("symbol", "-"),
+                "Buy": opp.get("buy_exchange", "-").title(),
+                "Sell": opp.get("sell_exchange", "-").title(),
+                "Buy Price": f"${opp.get('buy_price', 0):,.2f}",
+                "Sell Price": f"${opp.get('sell_price', 0):,.2f}",
+                "Profit %": f"{opp.get('net_profit_percent', 0):.4f}%",
+                "Est. Profit": f"${opp.get('estimated_profit_usd', 0):.2f}",
+                "Status": "✅ Executed" if opp.get("status") == "executed" else "⏳ Detected" if opp.get("status") == "detected" else "❌ Failed",
+            })
+
+        df = pd.DataFrame(opp_display)
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        st.info("No opportunities detected. Scanner is running...")
+        st.info("🔍 Waiting for arbitrage opportunities... Bot is scanning markets.")
 
-    st.caption("⏱️ Auto-refreshing every 1 second")
+    st.caption(f"📊 Total opportunities found: {len(opportunities)}")
 
 # Tab 2: Trade History
 with tab2:
-    st.subheader("Recent Trades")
+    st.subheader("Executed Trades")
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        filter_status = st.selectbox(
-            "Status",
-            ["All", "Completed", "Failed"],
-            key="filter_status",
+    if trades:
+        # Show trades newest first
+        recent_trades = trades[::-1]
+
+        trades_display = []
+        for t in recent_trades:
+            profit = t.get("net_profit", 0)
+            trades_display.append({
+                "Time": datetime.fromisoformat(t["executed_at"]).strftime("%H:%M:%S") if t.get("executed_at") else "-",
+                "Symbol": t.get("symbol", "-"),
+                "Buy": f"{t.get('buy_exchange', '-').title()} @ ${t.get('buy_price', 0):,.2f}",
+                "Sell": f"{t.get('sell_exchange', '-').title()} @ ${t.get('sell_price', 0):,.2f}",
+                "Volume": f"{t.get('volume', 0):.4f}",
+                "Gross P/L": f"${t.get('gross_profit', 0):+.2f}",
+                "Fees": f"${t.get('fees', 0):.2f}",
+                "Net P/L": f"${profit:+.2f}",
+                "Status": "✅" if t.get("status") == "completed" else "❌",
+                "Exec Time": f"{t.get('execution_ms', 0)}ms",
+            })
+
+        df_trades = pd.DataFrame(trades_display)
+        st.dataframe(df_trades, use_container_width=True, hide_index=True)
+
+        # Summary stats
+        total_gross = sum(t.get("gross_profit", 0) for t in recent_trades)
+        total_fees = sum(t.get("fees", 0) for t in recent_trades)
+        total_net = sum(t.get("net_profit", 0) for t in recent_trades)
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Gross Profit", f"${total_gross:+.2f}")
+        col2.metric("Total Fees", f"${total_fees:.2f}")
+        col3.metric("Net Profit", f"${total_net:+.2f}")
+
+        # Export button
+        st.download_button(
+            "📥 Export to CSV",
+            df_trades.to_csv(index=False),
+            "trades.csv",
+            "text/csv",
+            key="export_trades",
         )
-    with col2:
-        filter_type = st.selectbox(
-            "Type",
-            ["All", "Cross-Exchange", "Triangular", "Funding"],
-            key="filter_type",
-        )
-    with col3:
-        filter_period = st.selectbox(
-            "Period",
-            ["Today", "Last 7 Days", "Last 30 Days", "All Time"],
-            key="filter_period",
-        )
-
-    trades_data = [
-        {
-            "Time": "14:32:15",
-            "Symbol": "BTC/USDT",
-            "Type": "Cross-Exchange",
-            "Buy": "Binance @ $67,245",
-            "Sell": "Kraken @ $67,312",
-            "Volume": 0.05,
-            "Profit": "+$2.34",
-            "Status": "✅",
-            "Would Execute": "Yes",
-        },
-        {
-            "Time": "14:28:42",
-            "Symbol": "ETH/USDT",
-            "Type": "Cross-Exchange",
-            "Buy": "Coinbase @ $3,456",
-            "Sell": "Binance @ $3,461",
-            "Volume": 0.8,
-            "Profit": "+$1.12",
-            "Status": "✅",
-            "Would Execute": "Yes",
-        },
-        {
-            "Time": "14:25:18",
-            "Symbol": "SOL/USDT",
-            "Type": "Cross-Exchange",
-            "Buy": "Binance @ $178.50",
-            "Sell": "Kraken @ $178.15",
-            "Volume": 5.0,
-            "Profit": "-$0.45",
-            "Status": "❌",
-            "Would Execute": "No",
-        },
-        {
-            "Time": "14:21:05",
-            "Symbol": "BTC/USDT",
-            "Type": "Cross-Exchange",
-            "Buy": "Kraken @ $67,198",
-            "Sell": "Coinbase @ $67,275",
-            "Volume": 0.03,
-            "Profit": "+$1.89",
-            "Status": "✅",
-            "Would Execute": "Yes",
-        },
-        {
-            "Time": "14:18:33",
-            "Symbol": "ETH/USDT",
-            "Type": "Funding",
-            "Buy": "Spot @ $3,448",
-            "Sell": "Perp @ $3,455",
-            "Volume": 1.2,
-            "Profit": "+$3.21",
-            "Status": "✅",
-            "Would Execute": "Yes",
-        },
-    ]
-
-    df_trades = pd.DataFrame(trades_data)
-    st.dataframe(df_trades, use_container_width=True, hide_index=True)
-
-    st.download_button(
-        "📥 Export to CSV",
-        df_trades.to_csv(index=False),
-        "trades.csv",
-        "text/csv",
-        key="export_trades",
-    )
+    else:
+        st.info("📭 No trades executed yet. Waiting for profitable opportunities...")
 
 # Tab 3: Performance
 with tab3:
     st.subheader("Performance Analytics")
 
-    col1, col2 = st.columns(2)
+    if trades:
+        col1, col2 = st.columns(2)
 
-    with col1:
-        st.write("**Equity Curve**")
-        dates = pd.date_range(end=datetime.now(), periods=30, freq="D")
-        equity = [10000]
-        for i in range(29):
-            change = equity[-1] * (1 + (0.002 * (1 if i % 3 != 0 else -0.5)))
-            equity.append(change)
+        with col1:
+            st.write("**Equity Curve**")
 
-        fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=dates,
-                y=equity,
-                mode="lines",
-                fill="tozeroy",
-                line={"color": "#00FF00"},
-                name="Equity",
+            # Build equity curve from trades
+            equity = [10000]
+            times = [datetime.fromisoformat(trades[0]["executed_at"]) if trades else datetime.now()]
+
+            for t in trades:
+                profit = t.get("net_profit", 0)
+                equity.append(equity[-1] + profit)
+                if t.get("executed_at"):
+                    times.append(datetime.fromisoformat(t["executed_at"]))
+                else:
+                    times.append(times[-1])
+
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=list(range(len(equity))),
+                    y=equity,
+                    mode="lines",
+                    fill="tozeroy",
+                    line={"color": "#00FF00" if equity[-1] >= 10000 else "#FF4444"},
+                    name="Equity",
+                )
             )
-        )
-        fig.update_layout(
-            height=300,
-            margin={"l": 0, "r": 0, "t": 0, "b": 0},
-            yaxis_title="USD",
-            xaxis_title="",
-            template="plotly_dark",
-        )
-        st.plotly_chart(fig, use_container_width=True, key="equity_chart")
+            fig.update_layout(
+                height=300,
+                margin={"l": 0, "r": 0, "t": 0, "b": 0},
+                yaxis_title="USD",
+                xaxis_title="Trade #",
+                template="plotly_dark",
+            )
+            st.plotly_chart(fig, use_container_width=True, key="equity_chart")
 
-    with col2:
-        st.write("**Profit Distribution**")
-        profits = [2.34, 1.12, -0.45, 3.21, 0.98, -0.23, 1.87, 2.45, -0.67, 1.23, 0.56, 1.98]
-        fig = px.histogram(
-            x=profits,
-            nbins=20,
-            color_discrete_sequence=["#00FF00"],
-        )
-        fig.update_layout(
-            height=300,
-            margin={"l": 0, "r": 0, "t": 0, "b": 0},
-            xaxis_title="Profit ($)",
-            yaxis_title="Count",
-            template="plotly_dark",
-        )
-        st.plotly_chart(fig, use_container_width=True, key="profit_dist")
+        with col2:
+            st.write("**Profit Distribution**")
+            profits = [t.get("net_profit", 0) for t in trades]
 
-    col1, col2, col3 = st.columns(3)
+            if profits:
+                fig = px.histogram(
+                    x=profits,
+                    nbins=20,
+                    color_discrete_sequence=["#00FF00"],
+                )
+                fig.update_layout(
+                    height=300,
+                    margin={"l": 0, "r": 0, "t": 0, "b": 0},
+                    xaxis_title="Profit ($)",
+                    yaxis_title="Count",
+                    template="plotly_dark",
+                )
+                st.plotly_chart(fig, use_container_width=True, key="profit_dist")
 
-    with col1:
-        st.write("**Performance Metrics**")
-        st.write("Sharpe Ratio: **2.34**")
-        st.write("Sortino Ratio: **3.12**")
-        st.write("Profit Factor: **2.8**")
-        st.write("Avg Trade: **$1.24**")
+        # Stats
+        profits = [t.get("net_profit", 0) for t in trades]
+        winning = [p for p in profits if p > 0]
+        losing = [p for p in profits if p < 0]
 
-    with col2:
-        st.write("**Risk Metrics**")
-        st.write("Max Drawdown: **2.1%**")
-        st.write("Avg Trade Duration: **1.2s**")
-        st.write("Avg Slippage: **0.02%**")
-        st.write("Risk/Reward: **1:2.4**")
+        col1, col2, col3 = st.columns(3)
 
-    with col3:
-        st.write("**Execution Stats**")
-        st.write("Would-Have-Executed: **94%**")
-        st.write("Avg Latency: **32ms**")
-        st.write("Failed Orders: **6%**")
-        st.write("Partial Fills: **3%**")
+        with col1:
+            st.write("**Performance Metrics**")
+            avg_profit = sum(profits) / len(profits) if profits else 0
+            avg_win = sum(winning) / len(winning) if winning else 0
+            avg_loss = sum(losing) / len(losing) if losing else 0
+            st.write(f"Avg Trade: **${avg_profit:.2f}**")
+            st.write(f"Avg Win: **${avg_win:.2f}**")
+            st.write(f"Avg Loss: **${avg_loss:.2f}**")
+            profit_factor = abs(sum(winning) / sum(losing)) if losing and sum(losing) != 0 else float('inf')
+            st.write(f"Profit Factor: **{profit_factor:.2f}**")
+
+        with col2:
+            st.write("**Risk Metrics**")
+            st.write(f"Max Drawdown: **{portfolio.get('max_drawdown_percent', 0):.2f}%**")
+            exec_times = [t.get("execution_ms", 0) for t in trades]
+            avg_exec = sum(exec_times) / len(exec_times) if exec_times else 0
+            st.write(f"Avg Exec Time: **{avg_exec:.0f}ms**")
+            st.write(f"Total Trades: **{len(trades)}**")
+
+        with col3:
+            st.write("**Success Rate**")
+            completed = len([t for t in trades if t.get("status") == "completed"])
+            failed = len(trades) - completed
+            st.write(f"Completed: **{completed}** ({100*completed/len(trades):.1f}%)")
+            st.write(f"Failed: **{failed}**")
+            st.write(f"Win Rate: **{portfolio.get('win_rate', 0):.1f}%**")
+    else:
+        st.info("📊 Performance data will appear after trades are executed.")
 
 # Tab 4: Configuration
 with tab4:
-    st.subheader("Bot Configuration")
+    st.subheader("Simulation Configuration")
 
     col1, col2 = st.columns(2)
 
     with col1:
-        st.write("**Exchange Connections**")
+        st.write("**Simulated Exchanges**")
         exchanges = [
-            {"Exchange": "Binance", "Status": "🟢 Connected", "Markets": 127},
-            {"Exchange": "Kraken", "Status": "🟢 Connected", "Markets": 89},
-            {"Exchange": "Coinbase", "Status": "🟡 Connecting", "Markets": 0},
+            {"Exchange": "Binance", "Status": "🟢 Simulated", "Type": "CEX"},
+            {"Exchange": "Kraken", "Status": "🟢 Simulated", "Type": "CEX"},
+            {"Exchange": "Coinbase", "Status": "🟢 Simulated", "Type": "CEX"},
+            {"Exchange": "KuCoin", "Status": "🟢 Simulated", "Type": "CEX"},
+            {"Exchange": "Bybit", "Status": "🟢 Simulated", "Type": "CEX"},
         ]
         st.dataframe(pd.DataFrame(exchanges), hide_index=True, key="exchange_table")
 
-        if st.button("Test Connections", key="test_conn"):
-            with st.spinner("Testing..."):
-                import time
-
-                time.sleep(1)
-            st.success("All connections OK!")
-
     with col2:
-        st.write("**Strategy Settings**")
-        min_spread = st.number_input(
-            "Min Spread (%)",
-            value=0.05,
-            step=0.01,
-            key="min_spread",
-        )
-        max_slippage = st.number_input(
-            "Max Slippage (%)",
-            value=0.1,
-            step=0.01,
-            key="max_slippage",
-        )
-        order_timeout = st.number_input(
-            "Order Timeout (s)",
-            value=5,
-            step=1,
-            key="order_timeout",
-        )
-        funding_enabled = st.checkbox(
-            "Enable Funding Arbitrage",
-            value=True,
-            key="funding_enabled",
-        )
-        triangular_enabled = st.checkbox(
-            "Enable Triangular Arbitrage",
-            value=False,
-            key="triangular_enabled",
-        )
+        st.write("**Simulation Settings**")
+        st.info("""
+        **Current Settings:**
+        - Opportunity Rate: 40% per scan
+        - Profit Range: 0.03% - 0.35%
+        - Execution Success: 75%
+        - Scan Interval: 1.5s
+        - Initial Capital: $10,000
+        """)
 
-        if st.button("Save Configuration", key="save_config"):
-            st.success("Configuration saved!")
+    st.write("**How it works:**")
+    st.markdown("""
+    1. The simulator generates realistic arbitrage opportunities between exchanges
+    2. Each opportunity has a random profit margin (0.03% - 0.35%)
+    3. The paper trader executes trades with simulated slippage and fees
+    4. 75% of trades execute successfully (simulating real market conditions)
+    5. Portfolio tracks all P&L, win rate, and drawdown in real-time
+    """)
 
 st.divider()
-st.caption(
-    f"Arbitrage Bot v1.0 | Paper Trading Mode | Last update: {datetime.now().strftime('%H:%M:%S')}"
-)
+
+# Footer
+col1, col2 = st.columns([3, 1])
+with col1:
+    st.caption(
+        f"Arbitrage Bot v1.0 | Simulation Mode | "
+        f"Updated: {datetime.now().strftime('%H:%M:%S')}"
+    )
+with col2:
+    if is_running:
+        st.caption("🟢 Bot Running")
+    else:
+        st.caption("⚪ Bot Stopped")
+
+# Auto-refresh
+if auto_refresh and is_running:
+    time.sleep(refresh_rate)
+    st.rerun()
