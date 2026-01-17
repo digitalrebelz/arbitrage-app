@@ -1,4 +1,9 @@
-"""Full market scan - monitors ALL pairs and logs fill probability for ML training."""
+"""Full market scan - monitors ALL pairs and logs fill probability for ML training.
+
+Includes:
+- Crypto exchanges (Binance, Kraken, KuCoin, Bybit)
+- Polymarket prediction markets
+"""
 
 import asyncio
 import json
@@ -8,6 +13,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import ccxt.async_support as ccxt
+import httpx
 from loguru import logger
 
 from src.config.logging_config import setup_logging
@@ -19,6 +25,7 @@ from src.models.opportunity import ArbitrageOpportunity, ArbitrageType, Opportun
 STATE_FILE = Path("data/simulation_state.json")
 OPPORTUNITIES_LOG = Path("data/opportunities_log.jsonl")  # Line-delimited JSON for ML
 SPREADS_LOG = Path("data/spreads_log.jsonl")  # All spread data for analysis
+POLYMARKET_LOG = Path("data/polymarket_log.jsonl")  # Polymarket specific data
 
 # Exchanges
 EXCHANGES = {
@@ -34,6 +41,7 @@ EXCHANGE_FEES = {
     "kraken": Decimal("0.26"),
     "kucoin": Decimal("0.10"),
     "bybit": Decimal("0.10"),
+    "polymarket": Decimal("0.00"),  # Polymarket has no trading fees
 }
 
 # Common trading pairs to scan (expanded list)
@@ -50,6 +58,10 @@ SYMBOLS = [
     "PEPE/USDT", "SHIB/USDT", "FLOKI/USDT", "WIF/USDT", "BONK/USDT",
 ]
 
+# Polymarket API
+POLYMARKET_API = "https://clob.polymarket.com"
+POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com"
+
 
 def decimal_default(obj):
     if isinstance(obj, Decimal):
@@ -61,15 +73,21 @@ def decimal_default(obj):
 
 def append_jsonl(filepath: Path, data: dict) -> None:
     """Append a JSON line to file for ML training data."""
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    with open(filepath, "a") as f:
-        f.write(json.dumps(data, default=decimal_default) + "\n")
+    try:
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        with open(filepath, "a") as f:
+            f.write(json.dumps(data, default=decimal_default) + "\n")
+    except Exception as e:
+        logger.warning(f"Failed to append to {filepath}: {e}")
 
 
 def save_state(state: dict) -> None:
-    """Save dashboard state."""
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, default=decimal_default, indent=2))
+    """Save dashboard state with error handling."""
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(state, default=decimal_default, indent=2))
+    except Exception as e:
+        logger.error(f"Failed to save state: {e}")
 
 
 def calculate_fill_probability(
@@ -181,6 +199,134 @@ async def fetch_ticker_and_orderbook(exchange, symbol: str) -> dict | None:
     except Exception as e:
         logger.debug(f"Could not fetch {symbol}: {e}")
     return None
+
+
+async def fetch_polymarket_markets() -> list[dict]:
+    """Fetch active markets from Polymarket."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Get active markets from gamma API
+            response = await client.get(
+                f"{POLYMARKET_GAMMA_API}/markets",
+                params={"active": "true", "closed": "false", "limit": 50}
+            )
+            if response.status_code == 200:
+                markets = response.json()
+                logger.debug(f"Fetched {len(markets)} Polymarket markets")
+                return markets
+    except Exception as e:
+        logger.debug(f"Polymarket markets fetch error: {e}")
+    return []
+
+
+async def fetch_polymarket_orderbook(token_id: str) -> dict | None:
+    """Fetch orderbook for a Polymarket token."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{POLYMARKET_API}/book",
+                params={"token_id": token_id}
+            )
+            if response.status_code == 200:
+                return response.json()
+    except Exception as e:
+        logger.debug(f"Polymarket orderbook error for {token_id}: {e}")
+    return None
+
+
+async def scan_polymarket() -> list[dict]:
+    """Scan Polymarket for arbitrage opportunities."""
+    results = []
+    polymarket_data = []
+
+    try:
+        markets = await fetch_polymarket_markets()
+
+        for market in markets[:20]:  # Limit to top 20 for rate limiting
+            try:
+                question = market.get("question", "Unknown")
+                condition_id = market.get("conditionId", "")
+
+                # Get tokens (YES/NO outcomes)
+                tokens = market.get("tokens", [])
+                if len(tokens) < 2:
+                    continue
+
+                yes_token = next((t for t in tokens if t.get("outcome") == "Yes"), None)
+                no_token = next((t for t in tokens if t.get("outcome") == "No"), None)
+
+                if not yes_token or not no_token:
+                    continue
+
+                yes_price = float(yes_token.get("price", 0))
+                no_price = float(no_token.get("price", 0))
+
+                # Arbitrage check: YES + NO should equal ~$1.00
+                # If sum < 1.00, you can buy both and guaranteed profit
+                # If sum > 1.00, market is overpriced
+                total = yes_price + no_price
+                spread = abs(1.0 - total)
+
+                timestamp = datetime.now(timezone.utc).isoformat()
+
+                market_record = {
+                    "id": str(uuid4()),
+                    "timestamp": timestamp,
+                    "source": "polymarket",
+                    "market_type": "prediction",
+                    "question": question[:100],  # Truncate
+                    "condition_id": condition_id,
+                    "yes_price": yes_price,
+                    "no_price": no_price,
+                    "total_price": total,
+                    "spread_from_parity": spread * 100,  # As percentage
+                    "volume_24h": market.get("volume", 0),
+                    "liquidity": market.get("liquidity", 0),
+                    "is_arbitrage": total < 0.99 or total > 1.01,  # >1% from parity
+                }
+
+                polymarket_data.append(market_record)
+                append_jsonl(POLYMARKET_LOG, market_record)
+
+                # If significant arbitrage opportunity
+                if total < 0.98:  # Can buy YES+NO for less than $0.98
+                    profit_pct = (1.0 - total) * 100
+                    opp = {
+                        "id": str(uuid4()),
+                        "timestamp": timestamp,
+                        "symbol": f"PM:{question[:30]}",
+                        "exchange_buy": "polymarket",
+                        "exchange_sell": "polymarket",
+                        "buy_price": total,
+                        "sell_price": 1.0,
+                        "spread_pct": profit_pct,
+                        "fees_pct": 0,
+                        "net_pct": profit_pct,
+                        "fill_probability": 80.0,  # Estimated
+                        "is_profitable": True,
+                        "type": "prediction_market",
+                        "market_question": question,
+                        "yes_price": yes_price,
+                        "no_price": no_price,
+                        "status": "detected",
+                    }
+                    results.append(opp)
+                    append_jsonl(OPPORTUNITIES_LOG, opp)
+                    logger.info(
+                        f"🎯 POLYMARKET: {question[:40]}... "
+                        f"YES={yes_price:.3f} NO={no_price:.3f} "
+                        f"total={total:.3f} profit={profit_pct:.2f}%"
+                    )
+
+                await asyncio.sleep(0.1)  # Rate limiting
+
+            except Exception as e:
+                logger.debug(f"Error processing Polymarket market: {e}")
+
+    except Exception as e:
+        logger.warning(f"Polymarket scan error: {e}")
+
+    return results, polymarket_data
 
 
 async def scan_symbol(symbol: str, exchanges: dict) -> list[dict]:
@@ -323,11 +469,12 @@ async def scan_symbol(symbol: str, exchanges: dict) -> list[dict]:
 
 
 async def main() -> None:
-    """Full market scan with fill probability tracking."""
+    """Full market scan with fill probability tracking and Polymarket."""
     setup_logging()
     logger.info("Starting FULL MARKET SCAN with fill probability tracking")
-    logger.info(f"Monitoring {len(SYMBOLS)} symbols across {len(EXCHANGES)} exchanges")
-    logger.info(f"Data logged to: {SPREADS_LOG} and {OPPORTUNITIES_LOG}")
+    logger.info(f"Monitoring {len(SYMBOLS)} crypto symbols across {len(EXCHANGES)} exchanges")
+    logger.info("Also scanning Polymarket prediction markets")
+    logger.info(f"Data logged to: {SPREADS_LOG}, {OPPORTUNITIES_LOG}, {POLYMARKET_LOG}")
 
     # Initialize exchanges
     exchanges = {}
@@ -349,6 +496,7 @@ async def main() -> None:
 
     all_opportunities = []
     all_trades = []
+    polymarket_opportunities = []
     total_spreads_logged = 0
 
     iteration = 0
@@ -360,25 +508,32 @@ async def main() -> None:
         while True:
             iteration += 1
             iteration_opportunities = []
+            iteration_polymarket = []
 
-            # Scan all symbols
+            # Scan crypto exchanges
             for symbol in SYMBOLS:
                 try:
                     opps = await scan_symbol(symbol, exchanges)
                     iteration_opportunities.extend(opps)
-                    total_spreads_logged += len(EXCHANGES) * (len(EXCHANGES) - 1)  # Rough estimate
+                    total_spreads_logged += len(exchanges) * (len(exchanges) - 1)
                 except Exception as e:
                     logger.debug(f"Error scanning {symbol}: {e}")
 
-                # Small delay to respect rate limits
                 await asyncio.sleep(0.1)
+
+            # Scan Polymarket (every iteration)
+            try:
+                pm_opps, pm_data = await scan_polymarket()
+                iteration_polymarket.extend(pm_opps)
+                polymarket_opportunities.extend(pm_opps)
+            except Exception as e:
+                logger.debug(f"Polymarket scan error: {e}")
 
             all_opportunities.extend(iteration_opportunities)
 
-            # Execute paper trades for profitable opportunities
+            # Execute paper trades for profitable crypto opportunities
             for opp in iteration_opportunities:
                 try:
-                    # Create orderbook for paper trading
                     buy_ob = Orderbook(
                         symbol=opp["symbol"],
                         exchange=Exchange.BINANCE,
@@ -386,7 +541,7 @@ async def main() -> None:
                         asks=[OrderbookLevel(price=Decimal(str(opp["buy_price"])), volume=Decimal("100"))],
                         timestamp=datetime.now(timezone.utc),
                     )
-                    sell_ob = buy_ob  # Simplified
+                    sell_ob = buy_ob
 
                     arb_opp = ArbitrageOpportunity(
                         id=opp["id"],
@@ -428,7 +583,6 @@ async def main() -> None:
                     }
                     all_trades.append(trade_record)
 
-                    # Log for ML training (prediction vs actual)
                     append_jsonl(OPPORTUNITIES_LOG, {
                         **opp,
                         "trade_result": trade_record,
@@ -437,38 +591,43 @@ async def main() -> None:
                 except Exception as e:
                     logger.debug(f"Trade error: {e}")
 
-            # Update dashboard state
-            portfolio = paper_trader.get_portfolio()
+            # Update dashboard state (with error handling)
+            try:
+                portfolio = paper_trader.get_portfolio()
 
-            state = {
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-                "is_running": True,
-                "mode": "FULL SCAN + ML DATA",
-                "iteration": iteration,
-                "symbols_monitored": len(SYMBOLS),
-                "exchanges": list(exchanges.keys()),
-                "total_spreads_logged": total_spreads_logged,
-                "portfolio": {
-                    "total_value_usd": portfolio.total_value_usd,
-                    "total_pnl_usd": portfolio.total_pnl_usd,
-                    "total_pnl_percent": portfolio.total_pnl_percent,
-                    "total_trades": portfolio.total_trades,
-                    "winning_trades": portfolio.winning_trades,
-                    "losing_trades": portfolio.losing_trades,
-                    "win_rate": portfolio.win_rate,
-                    "max_drawdown_percent": portfolio.max_drawdown_percent,
-                },
-                "recent_opportunities": all_opportunities[-20:],
-                "recent_trades": all_trades[-20:],
-            }
-            save_state(state)
+                state = {
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "is_running": True,
+                    "mode": "FULL SCAN + ML DATA + POLYMARKET",
+                    "iteration": iteration,
+                    "symbols_monitored": len(SYMBOLS),
+                    "exchanges": list(exchanges.keys()) + ["polymarket"],
+                    "total_spreads_logged": total_spreads_logged,
+                    "polymarket_markets_scanned": len(polymarket_opportunities),
+                    "portfolio": {
+                        "total_value_usd": portfolio.total_value_usd,
+                        "total_pnl_usd": portfolio.total_pnl_usd,
+                        "total_pnl_percent": portfolio.total_pnl_percent,
+                        "total_trades": portfolio.total_trades,
+                        "winning_trades": portfolio.winning_trades,
+                        "losing_trades": portfolio.losing_trades,
+                        "win_rate": portfolio.win_rate,
+                        "max_drawdown_percent": portfolio.max_drawdown_percent,
+                    },
+                    "recent_opportunities": (all_opportunities + polymarket_opportunities)[-20:],
+                    "recent_trades": all_trades[-20:],
+                }
+                save_state(state)
+            except Exception as e:
+                logger.error(f"Failed to update state: {e}")
 
             # Log progress
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
+            portfolio = paper_trader.get_portfolio()
             logger.info(
                 f"[{elapsed:.0f}s] Iter {iteration}: "
-                f"scanned={len(SYMBOLS)} symbols | "
-                f"opportunities={len(iteration_opportunities)} | "
+                f"crypto={len(iteration_opportunities)} | "
+                f"polymarket={len(iteration_polymarket)} | "
                 f"total_logged={total_spreads_logged} | "
                 f"trades={portfolio.total_trades} | "
                 f"P&L=${portfolio.total_pnl_usd:+.2f}"
@@ -479,9 +638,14 @@ async def main() -> None:
 
     except KeyboardInterrupt:
         logger.info("Shutting down...")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
     finally:
         for name, exchange in exchanges.items():
-            await exchange.close()
+            try:
+                await exchange.close()
+            except Exception:
+                pass
 
         # Final stats
         elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
@@ -494,11 +658,37 @@ async def main() -> None:
         logger.info(f"Iterations: {iteration}")
         logger.info(f"Symbols Monitored: {len(SYMBOLS)}")
         logger.info(f"Total Spreads Logged: {total_spreads_logged}")
-        logger.info(f"Opportunities Found: {len(all_opportunities)}")
+        logger.info(f"Crypto Opportunities: {len(all_opportunities)}")
+        logger.info(f"Polymarket Opportunities: {len(polymarket_opportunities)}")
         logger.info(f"Trades Executed: {portfolio.total_trades}")
         logger.info(f"Final P&L: ${portfolio.total_pnl_usd:+.2f}")
         logger.info(f"Data saved to: {SPREADS_LOG}")
         logger.info("=" * 60)
+
+        # Save final state
+        state = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "is_running": False,
+            "mode": "FULL SCAN + ML DATA + POLYMARKET",
+            "iteration": iteration,
+            "symbols_monitored": len(SYMBOLS),
+            "exchanges": list(exchanges.keys()) + ["polymarket"],
+            "total_spreads_logged": total_spreads_logged,
+            "polymarket_markets_scanned": len(polymarket_opportunities),
+            "portfolio": {
+                "total_value_usd": portfolio.total_value_usd,
+                "total_pnl_usd": portfolio.total_pnl_usd,
+                "total_pnl_percent": portfolio.total_pnl_percent,
+                "total_trades": portfolio.total_trades,
+                "winning_trades": portfolio.winning_trades,
+                "losing_trades": portfolio.losing_trades,
+                "win_rate": portfolio.win_rate,
+                "max_drawdown_percent": portfolio.max_drawdown_percent,
+            },
+            "recent_opportunities": (all_opportunities + polymarket_opportunities)[-20:],
+            "recent_trades": all_trades[-20:],
+        }
+        save_state(state)
 
 
 if __name__ == "__main__":
