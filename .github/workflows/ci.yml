@@ -98,7 +98,7 @@ jobs:
           pytest tests/e2e/ -v --headed || true
 
       - name: Upload screenshots
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: e2e-screenshots
